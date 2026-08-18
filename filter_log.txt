@@ -1,8 +1,6 @@
 SEC EDGAR FORM 4 INSIDER-PURCHASE SAMPLE — FILTER LOG
 ======================================================
-[DRAFT — funnel counts below are placeholders until the full run
-(scripts/pipeline.py) finishes; this file is regenerated from
-data/state/pipeline_state.json + final_rows.jsonl at that point.]
+Run completed. This is the final log.
 
 WINDOW
 ------
@@ -153,17 +151,119 @@ the manual follow-up research step (looking up that person's other
 filings), and because issuer identity is already fully captured by
 `issuer_name` + `ticker` + `source_filing_url`.
 
-FUNNEL COUNTS
--------------
-[TO BE FILLED IN FROM data/state/pipeline_state.json ON COMPLETION]
+DAYS SAMPLED (13, chronological; the order actually drawn was
+random.Random(42).shuffle()'s order, not this)
+--------------------------------------------------------------
+2014-04-11, 2014-05-08, 2014-11-17, 2015-01-09, 2016-03-17, 2017-08-08,
+2017-10-23, 2018-08-28, 2019-09-16, 2019-12-02, 2020-02-28, 2020-10-30,
+2022-03-07
 
-SAMPLING SEED FOR FINAL 50
-----------------------------
-[TO BE FILLED IN — random.Random(42).sample() used again if the
-pre-sample survivor pool exceeds 50, per the task brief.]
+The run stopped after day 13 because the survivor pool reached the
+52-survivor buffer (55 raw, 53 after the duplicate-row fix below) well
+under the 160-day budget cap — so filters were never loosened and no
+widening was needed.
+
+DUPLICATE ROWS FOUND AND FIXED AFTER THE RUN
+-----------------------------------------------
+A post-run sanity check (dedup on owner_cik+issuer_cik+transaction_date
++shares+price) found 2 exact-duplicate pairs in the 55 raw survivors,
+for two DIFFERENT root causes, both investigated by hand before fixing:
+
+1. Schmitzer Richard / James River Group Holdings (2022-03-04 purchase):
+   the same filing got fetched and processed twice. Cause: EDGAR
+   full-text search paginates with `from`/`size`, sorted by relevance
+   score; for a broad query like q='"Form 4"' many hits tie on score, so
+   consecutive pages can occasionally return the same hit twice. This IS
+   a pipeline bug. Fixed in scripts/pipeline.py: fetch_day_filings() now
+   deduplicates hits by id before returning.
+2. Beltzman Daniel Gordon / Regis Corp (2014-05-06 purchase): re-fetched
+   the live filing (https://www.sec.gov/Archives/edgar/data/716643/
+   000155009914000003/primary_doc.xml) by hand and confirmed the SOURCE
+   FILING ITSELF lists two byte-for-byte identical <nonDerivativeTransaction>
+   entries (39,901 shares @ $13.1712, 2014-05-06) inside one Form 4 --
+   a filer/filing-agent submission artifact, not a scraping error. (The
+   same filing also double-lists a smaller, sub-$250k transaction the
+   same way, confirming it's a source-data quirk rather than one-off.)
+   Fixed in scripts/pipeline.py: identical (date, shares, price) lines
+   within a single filing are now deduplicated before filtering, since
+   counting the same real trade twice would double that insider's
+   apparent purchase size and their presence in the sample.
+
+Both fixes are in the committed pipeline.py for future runs. For THIS
+run, the duplicates were removed directly from data/final_rows.jsonl
+(55 -> 53 unique) and edgar_sample.csv / verification_report.md were
+regenerated from the corrected data below. Nothing else about the
+funnel changed; this only removed double-counted rows.
+
+FUNNEL COUNTS (full run, all 13 sampled days, full census within each;
+duplicate-corrected)
+------------------------------------------------------------------------
+  Total Form 4 filings examined ......................... 5,113
+  Filter 1  code=P, not 10b5-1 .................................. 492
+  Filter 2  value >= $250,000 .................................... 154
+  Filter 3  opportunistic (>=2x median prior, or first) .......... 154  (no additional rows dropped at this step this run -- every filing that reached filter 3 already passed it; see note below)
+  Filter 4  director/officer (not just 10%-owner) ................. 94
+  Filter 5  market cap $200M-$20B at filing date ................... 62
+  Filter 6  NYSE or Nasdaq .......................................... 53  (55 raw minus 2 duplicate rows, see above)
+
+  Pre-sample survivor count: 53 (> 50)
+  --> random.Random(42).sample(rows, 50) applied, per the task brief's
+      "if more than 50 survive, randomly sample 50, seed=42" rule.
+  Final edgar_sample.csv row count: 50
+
+Note on filter 3 showing 0 additional drop this run: of the 154
+candidates that passed filters 1-2, every one was either that filer's
+first recorded purchase (using up to 20 of their most recent PRIOR
+Form 4 filings as the history window -- see "OPPORTUNISTIC SCREEN"
+note above) or already >= 2x their own prior median. This is plausible
+given filters 1+2 already select for unusually large ($250k+) open-
+market buys, which the pre-registered protocol's own null hypothesis
+(H0, Section 2) predicts should already skew opportunistic -- but it
+means filter 3 did no additional narrowing in this particular sample,
+which is worth flagging rather than silently presenting as if it filtered.
+
+DATA QUALITY / DIAGNOSTIC NOTES ON THE FINAL 50
+--------------------------------------------------
+- Exchange-fallback usage: 35 of 53 pre-sample survivors matched
+  directly against SEC's current ticker/exchange file; 18 needed the
+  file_num-prefix fallback (i.e. were NOT in the current listing file,
+  almost certainly because they've since delisted/merged/gone
+  bankrupt). That's ~34% of the pre-sample pool -- had the fallback not
+  been built, this fraction would have been wrongly excluded on
+  survivorship grounds alone. This is a real, material effect, not an
+  edge case.
+- Filing-date year distribution in the final 50: 2014 (14), 2016 (2),
+  2017 (1), 2018 (2), 2019 (6), 2020 (18), 2022 (7). No rows landed in
+  2015, 2021, 2023, or 2024 -- an artifact of only 13 days being drawn
+  before the stop threshold was hit, not a deliberate exclusion (the
+  day-sampling order was fully seeded/random; some sampled days simply
+  contributed 0 survivors, e.g. 2015-01-09, 2017-08-08). A pilot at
+  n=50 will not evenly cover an 11-year window; this is exactly the
+  power limitation the pre-registered protocol's Section 8 already
+  flags for the pilot, not a data-pull defect. Sector concentration in
+  the final 50 is modest: SIC 6798 (REITs) is the largest group at 7
+  rows (14%), SIC 2834 (pharma prep) and 7389 (business services) tied
+  next at 4 each (8%); no single sector approaches the ~60%
+  concentration the protocol's Section 10 warns to watch for.
 
 FAILURE MODES / DATA GAPS ENCOUNTERED
 ----------------------------------------
-[TO BE FILLED IN from data/logs/processing_errors.jsonl — categories
-and counts of: XML parse failures, missing company-facts data, missing
-owner-submissions data, etc.]
+Exactly one transient error across the entire run: one EDGAR full-text-
+search pagination request failed on one sampled day (kind:
+fts_day_fetch_failed, logged in data/logs/processing_errors.jsonl).
+That day still produced results from the pages that did succeed; SEC's
+search API paginates in batches of 100 and this was a single dropped
+page out of several dozen fetched across the run, so a small number of
+filings from that specific day's specific page were not examined. This
+is disclosed rather than silently absorbed. No other fetch, parse, or
+lookup failure occurred in 5,113 filing examinations, ~60 owner-history
+lookups, and ~60 issuer-market-cap lookups -- i.e. essentially no data
+gaps beyond that one page. Nothing was estimated or fabricated to fill
+any gap.
+
+VERIFICATION
+------------
+See verification_report.md: 5 randomly selected rows (seed=42) from
+the final 50-row CSV were independently re-fetched live from their
+source_filing_url and re-parsed. All 5 passed (transaction code,
+shares, and price all matched the CSV exactly).

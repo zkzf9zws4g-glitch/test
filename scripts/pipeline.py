@@ -173,7 +173,21 @@ def fetch_day_filings(day):
             break
         if not page_hits:
             break
-    return hits
+
+    # Elasticsearch's default sort has ties on relevance score for a query
+    # this broad (q='"Form 4"' matches nearly every hit near-identically),
+    # so consecutive "from"-paginated pages can occasionally overlap and
+    # return the same hit twice. Deduplicate by id defensively -- caught
+    # in the wild as one duplicated filing producing two identical rows
+    # in an early run (see filter_log.txt "DATA QUALITY" notes).
+    seen_ids = set()
+    deduped = []
+    for h in hits:
+        if h["id"] in seen_ids:
+            continue
+        seen_ids.add(h["id"])
+        deduped.append(h)
+    return deduped
 
 
 def build_xml_url(hit, cik_for_path):
@@ -391,7 +405,24 @@ def process_day(day, state, exchange_map):
                 continue
             state["funnel"]["filter1_code_p_not_10b5_1"] += 1
 
+            # A small number of real Form 4 filings list the exact same
+            # transaction line twice within nonDerivativeTable (a filer/
+            # filing-agent submission artifact, not something SEC
+            # validates away -- confirmed by hand on a live filing; see
+            # filter_log.txt). Dedupe identical (date, shares, price)
+            # lines within one filing so the same real trade isn't
+            # counted, and doesn't inflate one insider's presence in the
+            # sample, twice.
+            seen_txn_keys = set()
+            deduped_txns = []
             for t in p_txns:
+                k = (t["transaction_date"], t["shares"], t["price_per_share"])
+                if k in seen_txn_keys:
+                    continue
+                seen_txn_keys.add(k)
+                deduped_txns.append(t)
+
+            for t in deduped_txns:
                 try:
                     shares = float(t["shares"])
                     price = float(t["price_per_share"])
