@@ -24,7 +24,7 @@ REQUEST_LOG_PATH = os.path.join(LOG_DIR, "request_log.jsonl")
 
 _lock = threading.Lock()
 _last_request_time = [0.0]
-MIN_INTERVAL = 0.13  # ~7.5 req/s, safely under SEC's 10 req/s cap
+MIN_INTERVAL = 0.11  # ~9 req/s, safely under SEC's 10 req/s cap
 
 _session = requests.Session()
 _session.headers.update(HEADERS)

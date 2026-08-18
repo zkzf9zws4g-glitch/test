@@ -1,0 +1,169 @@
+SEC EDGAR FORM 4 INSIDER-PURCHASE SAMPLE — FILTER LOG
+======================================================
+[DRAFT — funnel counts below are placeholders until the full run
+(scripts/pipeline.py) finishes; this file is regenerated from
+data/state/pipeline_state.json + final_rows.jsonl at that point.]
+
+WINDOW
+------
+Filing dates: 2014-01-01 through 2024-06-30 (inclusive).
+
+DATA SOURCE
+-----------
+- Filing discovery: SEC EDGAR full-text search API
+  (https://efts.sec.gov/LATEST/search-index), q='"Form 4"', forms=4,
+  dateRange=custom, one calendar day per query (startdt=enddt=<day>).
+  This API caps any single query at 10,000 hits (from+size<=10000);
+  querying one day at a time (observed ~500-700 Form 4 filings/business
+  day) stays comfortably under that cap.
+- Transaction data: each filing's primary ownershipDocument XML,
+  fetched directly at
+  https://www.sec.gov/Archives/edgar/data/{CIK}/{accession-no-dashes}/{filename}
+  (filename taken directly from the full-text-search hit's `_id` field,
+  which points at the exact primary document — no separate index.json
+  lookup needed). Exhibits attached to the same accession (e.g. powers
+  of attorney) are excluded by requiring the search hit's `file_type`
+  field == "4" and the filename to end in .xml.
+- Market cap: SEC XBRL company facts API,
+  https://data.sec.gov/api/xbrl/companyfacts/CIK{10-digit-padded}.json,
+  field dei:EntityCommonStockSharesOutstanding (falls back to
+  us-gaap:CommonStockSharesOutstanding if absent), most recent value
+  with `end` date <= the filing date.
+- Exchange: SEC's own https://www.sec.gov/files/company_tickers_exchange.json
+  (CIK -> current ticker/exchange), with a documented fallback — see
+  "FILTER 6" below.
+- Prior purchase history (for the opportunistic screen): each filer's
+  own https://data.sec.gov/submissions/CIK{10-digit-padded}.json, which
+  lists their full personal filing history (SEC assigns individual
+  CIKs to insiders, independent of which company they filed about).
+
+VERIFICATION BEFORE THE PULL
+-----------------------------
+Fetched Apple's (CIK 0000320193) and Microsoft's (CIK 0000789019) EDGAR
+company pages directly and confirmed issuer-specific content (Cupertino
+address for Apple, Redmond address for Microsoft) with different
+response fingerprints (sha256[:16]: 140ebc02b1d5286d vs f6210f0a64ef0918)
+— ruling out a cached/generic-response failure mode before building the
+rest of the pipeline. Every HTTP request made by the pipeline is logged
+to data/logs/request_log.jsonl with its exact URL, status code, elapsed
+time, and a sha256[:16] fingerprint of the response body.
+
+RATE LIMITING
+-------------
+All requests go through a single rate-limited client (scripts/common.py)
+enforcing a minimum 0.11s between requests (~9 req/s), under SEC's
+10 req/s fair-access limit, with a real, identifying User-Agent header
+("PeopleSignalPilot research donevtm@gmail.com") and automatic retry
+with backoff on 429/403/503.
+
+SAMPLING METHODOLOGY (seed = 42)
+---------------------------------
+The full population of Form 4 filings in this window is far larger than
+can be exhaustively fetched and XML-parsed under the rate limit within
+one working session (business-day counts observed in the 500-700/day
+range imply >1,000,000 filings across the ~2,700 business days in the
+window). So this is a two-stage cluster random sample, not a sample of
+the full pre-computed filtered population:
+
+  Stage A — business days (Mon-Fri, 2014-01-01..2024-06-30) are the
+  sampling clusters. The full list of business days is shuffled with
+  Python's random.Random(42).shuffle() — a single, fixed, reproducible
+  seed — which fixes both which days get drawn and the order.
+
+  Stage B — within each sampled day, EVERY Form 4 filing that day is
+  examined (a full census within the cluster, not a further subsample),
+  so there is no additional within-day selection bias.
+
+  Days are drawn and fully processed one at a time until either (a) the
+  pool of filings surviving all 6 filters reaches 52 (a small buffer
+  above the 40-50 target), or (b) a hard cap of 160 days is reached.
+  This deviates from a literal "filter the full population, then random-
+  sample 50" design (infeasible at this scale under SEC's rate limit)
+  but is, itself, a genuine random sample — reproducible from the seed
+  and this script — not a curated one. No day or filing was ever skipped
+  or dropped because of what it contained.
+
+FILTERS APPLIED IN ORDER
+-------------------------
+1. Transaction code = "P" (open-market purchase), on the non-derivative
+   table only, AND not flagged as a Rule 10b5-1 trading-plan transaction.
+   10b5-1 detection: the document-level <aff10b5One> checkbox (added to
+   the Form 4 XML schema in Feb 2023) when present; for filings that
+   predate that schema field, a case-insensitive scan of the filing's
+   <footnotes> text for "10b5-1" is used as a fallback signal. This
+   fallback will miss a 10b5-1 trade whose footnote never uses that
+   exact string, so some pre-2023 10b5-1-scheduled purchases may survive
+   into the sample — a known limitation, not something we could fully
+   automate away given available data.
+2. Transaction value (shares x price-per-share, from that same
+   transaction line) >= $250,000.
+3. Opportunistic screen: purchase value >= 2x the filer's own median
+   prior open-market-purchase value, OR it is their first recorded
+   purchase. "Prior" purchase history = that filer's own P-coded
+   non-derivative transactions found in up to 20 of their most recent
+   Form 4 filings strictly before the current filing date (capped at 20
+   for request-volume reasons — a filer with an very long, sparse
+   purchase history could in principle have an older purchase that
+   falls outside this window and isn't counted in the median; this is a
+   documented approximation, not a full-lifetime history in every case).
+4. Filer role: reportingOwnerRelationship isDirector=1 OR isOfficer=1
+   (a filer who is ONLY a 10%-owner, with both of those false, is
+   excluded, per the task's explicit instruction).
+5. Issuer market cap between $200M and $20B at the filing date.
+   Market cap = shares outstanding (as of the nearest company-facts
+   date <= filing date) x the transaction's own price-per-share. No
+   independent market-data API was reachable from this environment
+   (stooq.com returned a JS/bot-check page, not data) — the insider's
+   own reported execution price for an open-market purchase is used as
+   the filing-date price proxy instead. This is a reasonable but
+   documented approximation, not an independently-sourced closing price.
+6. Exchange: NYSE or Nasdaq only (OTC/pink sheets excluded). Primary
+   check is SEC's own company_tickers_exchange.json. IMPORTANT: that
+   file is a CURRENT-DAY snapshot of active listings, so any issuer
+   that has since been delisted, gone bankrupt, or been acquired would
+   silently disappear from it even if it was legitimately NYSE/Nasdaq-
+   listed at its filing date — which would survivorship-bias the sample
+   toward companies still trading today. Two real examples hit during
+   development: Revlon Inc (NYSE:REV, delisted 2022 bankruptcy) and Ion
+   Geophysical Corp (NYSE:IO, delisted 2022 bankruptcy) are both absent
+   from the current file. Fallback used when an issuer isn't in the
+   current file: the filing's own SEC Exchange Act file number (from
+   the full-text-search hit metadata, no extra request needed) — a
+   "001-" prefix means the issuer was registered under Exchange Act
+   Section 12(b) (listed on a national securities exchange) AT FILING
+   TIME; "000-"/absent means Section 12(g) (OTC/unlisted). This
+   correctly recovers legitimately-NYSE-listed-at-the-time issuers like
+   Revlon, but can't distinguish NYSE vs Nasdaq vs a minor exchange
+   (e.g. NYSE American) specifically for delisted issuers — those rows'
+   `exchange` field is written as "NYSE/Nasdaq (inferred, not in
+   current listing file)" rather than a specific hard claim, so this
+   uncertainty is visible in the output rather than hidden.
+
+FILTER NOT AUTOMATED (BY DESIGN)
+----------------------------------
+Per instructions, "was this person a proven founder/operator" was NOT
+attempted — no automated or heuristic scoring of operator quality was
+applied. That is an explicitly manual, later step.
+
+COLUMN NOTE: "cik"
+-------------------
+The output CSV's `cik` column is the FILER's (reporting owner's) own
+SEC CIK, not the issuer's — chosen because it's the more useful key for
+the manual follow-up research step (looking up that person's other
+filings), and because issuer identity is already fully captured by
+`issuer_name` + `ticker` + `source_filing_url`.
+
+FUNNEL COUNTS
+-------------
+[TO BE FILLED IN FROM data/state/pipeline_state.json ON COMPLETION]
+
+SAMPLING SEED FOR FINAL 50
+----------------------------
+[TO BE FILLED IN — random.Random(42).sample() used again if the
+pre-sample survivor pool exceeds 50, per the task brief.]
+
+FAILURE MODES / DATA GAPS ENCOUNTERED
+----------------------------------------
+[TO BE FILLED IN from data/logs/processing_errors.jsonl — categories
+and counts of: XML parse failures, missing company-facts data, missing
+owner-submissions data, etc.]
