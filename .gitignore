@@ -2,5 +2,6 @@ data/cache/
 data/logs/
 data/state/
 data/raw/
+data/*.jsonl
 __pycache__/
 *.pyc
