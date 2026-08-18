@@ -28,8 +28,18 @@ MIN_INTERVAL = 0.11  # ~9 req/s, safely under SEC's 10 req/s cap
 
 _session = requests.Session()
 _session.headers.update(HEADERS)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 _log_fh = open(REQUEST_LOG_PATH, "a")
+_log_lock = threading.Lock()
+
+
+def _write_log(entry):
+    with _log_lock:
+        _log_fh.write(json.dumps(entry) + "\n")
+        _log_fh.flush()
 
 
 def _fingerprint(content: bytes) -> str:
@@ -57,8 +67,7 @@ def get(url, params=None, timeout=30, max_retries=5):
                 "error": str(e),
                 "attempt": attempt,
             }
-            _log_fh.write(json.dumps(entry) + "\n")
-            _log_fh.flush()
+            _write_log(entry)
             time.sleep(1.5 * (attempt + 1))
             continue
 
@@ -72,8 +81,7 @@ def get(url, params=None, timeout=30, max_retries=5):
             "resp_len": len(resp.content),
             "resp_first200": resp.text[:200] if resp.text else "",
         }
-        _log_fh.write(json.dumps(entry) + "\n")
-        _log_fh.flush()
+        _write_log(entry)
 
         if resp.status_code == 200:
             return resp
