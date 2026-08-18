@@ -29,7 +29,9 @@ import os
 import random
 import statistics
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common import get, REPO_ROOT
 from parse_form4 import parse_form4_xml
@@ -59,17 +61,21 @@ DAY_LOG_PATH = os.path.join(LOG_DIR, "day_progress.jsonl")
 # Stop pulling more days once we have this many full survivors (buffer
 # above the 40-50 target so the final random-sample-of-50 step, if
 # triggered, has real headroom).
-TARGET_FINAL_BUFFER = 65
-MAX_DAYS_BUDGET = 130
-MAX_PRIOR_FILINGS_PER_OWNER = 40  # see filter_log.txt "opportunistic screen" note
+TARGET_FINAL_BUFFER = 52
+MAX_DAYS_BUDGET = 160
+MAX_PRIOR_FILINGS_PER_OWNER = 20  # see filter_log.txt "opportunistic screen" note
 
 FTS_BASE = "https://efts.sec.gov/LATEST/search-index"
 PRICE_MISSING_SENTINEL = object()
 
 
+_error_log_lock = threading.Lock()
+
+
 def log_error(kind, detail):
-    with open(ERROR_LOG_PATH, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "kind": kind, "detail": detail}) + "\n")
+    with _error_log_lock:
+        with open(ERROR_LOG_PATH, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "kind": kind, "detail": detail}) + "\n")
 
 
 def business_days(start, end):
@@ -152,6 +158,7 @@ def fetch_day_filings(day):
             filename = h["_id"].split(":", 1)[1]
             if not filename.lower().endswith(".xml"):  # primary Form 4 doc is always XML
                 continue
+            file_nums = src.get("file_num") or []
             hits.append({
                 "id": h["_id"],
                 "adsh": src["adsh"],
@@ -159,13 +166,28 @@ def fetch_day_filings(day):
                 "file_date": src.get("file_date"),
                 "display_names": src.get("display_names", []),
                 "sics": src.get("sics", []),
+                "file_num": file_nums[0] if file_nums else None,
             })
         frm += page_size
         if frm >= total or frm >= 9900:  # stay under the 10k window cap
             break
         if not page_hits:
             break
-    return hits
+
+    # Elasticsearch's default sort has ties on relevance score for a query
+    # this broad (q='"Form 4"' matches nearly every hit near-identically),
+    # so consecutive "from"-paginated pages can occasionally overlap and
+    # return the same hit twice. Deduplicate by id defensively -- caught
+    # in the wild as one duplicated filing producing two identical rows
+    # in an early run (see filter_log.txt "DATA QUALITY" notes).
+    seen_ids = set()
+    deduped = []
+    for h in hits:
+        if h["id"] in seen_ids:
+            continue
+        seen_ids.add(h["id"])
+        deduped.append(h)
+    return deduped
 
 
 def build_xml_url(hit, cik_for_path):
@@ -199,6 +221,7 @@ def fetch_and_parse_filing(hit):
     parsed["_source_url"] = url
     parsed["_file_date"] = hit["file_date"]
     parsed["_sics"] = hit.get("sics", [])
+    parsed["_file_num"] = hit.get("file_num")
     return parsed
 
 
@@ -334,6 +357,27 @@ def mark_filing_processed(filing_id):
 _PROCESSED_FILING_IDS = None
 
 
+FETCH_WORKERS = 8  # concurrent XML fetches per day; the real bottleneck observed
+                    # in this environment is per-request network/proxy latency
+                    # (~0.2-1s), not SEC's rate cap, so parallel in-flight
+                    # requests (still globally paced by common.get()'s shared
+                    # rate limiter -> real aggregate stays under 10 req/s)
+                    # give a large wall-clock speedup with no extra risk.
+
+
+def _fetch_and_prefilter(hit):
+    """Runs in a worker thread: fetch + parse + the two cheap, purely-local
+    checks (transaction code, 10b5-1). Returns (hit, parsed_or_None,
+    p_txns_or_None) -- no shared-state mutation happens in here."""
+    parsed = fetch_and_parse_filing(hit)
+    if parsed is None:
+        return hit, None, None
+    if is_10b5_1(parsed):
+        return hit, parsed, []
+    p_txns = [t for t in parsed["transactions"] if t["transaction_code"] == "P"]
+    return hit, parsed, p_txns
+
+
 def process_day(day, state, exchange_map):
     global _PROCESSED_FILING_IDS
     if _PROCESSED_FILING_IDS is None:
@@ -343,122 +387,166 @@ def process_day(day, state, exchange_map):
     hits = fetch_day_filings(day)
     day_summary = {"day": ds, "n_filings": len(hits)}
 
-    for hit in hits:
-        # filing-level idempotency: if a crash interrupted a previous run
-        # mid-day, this day gets fully re-walked on resume (it's not yet
-        # in processed_days), but any filing already recorded is skipped
-        # so funnel counts / output rows never get double-counted.
-        if hit["id"] in _PROCESSED_FILING_IDS:
-            continue
-        mark_filing_processed(hit["id"])
-        _PROCESSED_FILING_IDS.add(hit["id"])
+    # filing-level idempotency: if a crash interrupted a previous run
+    # mid-day, this day gets fully re-walked on resume (it's not yet in
+    # processed_days), but any filing already recorded is skipped so
+    # funnel counts / output rows never get double-counted.
+    todo = [h for h in hits if h["id"] not in _PROCESSED_FILING_IDS]
+    for h in todo:
+        mark_filing_processed(h["id"])
+        _PROCESSED_FILING_IDS.add(h["id"])
 
-        state["funnel"]["total_filings_examined"] += 1
-        parsed = fetch_and_parse_filing(hit)
-        if parsed is None:
-            continue
-        if is_10b5_1(parsed):
-            continue
-
-        p_txns = [t for t in parsed["transactions"] if t["transaction_code"] == "P"]
-        if not p_txns:
-            continue
-        state["funnel"]["filter1_code_p_not_10b5_1"] += 1
-
-        for t in p_txns:
-            try:
-                shares = float(t["shares"])
-                price = float(t["price_per_share"])
-            except (TypeError, ValueError):
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        futures = [pool.submit(_fetch_and_prefilter, h) for h in todo]
+        for fut in as_completed(futures):
+            hit, parsed, p_txns = fut.result()
+            state["funnel"]["total_filings_examined"] += 1
+            if parsed is None or not p_txns:
                 continue
-            value = shares * price
-            if value < 250000:
-                continue
-            state["funnel"]["filter2_value_250k"] += 1
+            state["funnel"]["filter1_code_p_not_10b5_1"] += 1
 
-            candidate = {
-                "owner_cik_padded": parsed["owner_cik_padded"],
-                "owner_cik": parsed["owner_cik"],
-                "owner_name": parsed["owner_name"],
-                "issuer_cik_padded": parsed["issuer_cik_padded"],
-                "issuer_cik": parsed["issuer_cik"],
-                "issuer_name": parsed["issuer_name"],
-                "issuer_ticker": parsed["issuer_ticker"],
-                "filing_date": parsed["_file_date"],
-                "transaction_date": t["transaction_date"],
-                "transaction_code": t["transaction_code"],
-                "shares": shares,
-                "price_per_share": price,
-                "transaction_value": value,
-                "is_director": parsed["is_director"],
-                "is_officer": parsed["is_officer"],
-                "is_ten_pct_owner": parsed["is_ten_pct_owner"],
-                "officer_title": parsed["officer_title"],
-                "sic_code": (parsed["_sics"][0] if parsed.get("_sics") else None),
-                "source_filing_url": parsed["_source_url"],
-            }
-            append_jsonl(STAGE12_PATH, candidate)
+            # A small number of real Form 4 filings list the exact same
+            # transaction line twice within nonDerivativeTable (a filer/
+            # filing-agent submission artifact, not something SEC
+            # validates away -- confirmed by hand on a live filing; see
+            # filter_log.txt). Dedupe identical (date, shares, price)
+            # lines within one filing so the same real trade isn't
+            # counted, and doesn't inflate one insider's presence in the
+            # sample, twice.
+            seen_txn_keys = set()
+            deduped_txns = []
+            for t in p_txns:
+                k = (t["transaction_date"], t["shares"], t["price_per_share"])
+                if k in seen_txn_keys:
+                    continue
+                seen_txn_keys.add(k)
+                deduped_txns.append(t)
 
-            # --- filter 3: opportunistic screen ---
-            if not candidate["owner_cik_padded"] or not candidate["filing_date"]:
-                continue
-            prior = get_owner_prior_purchases(candidate["owner_cik_padded"], candidate["filing_date"])
-            if prior:
-                med = statistics.median(p["value"] for p in prior)
-                opp_reason = f"prior_median={med:.2f}, n_prior={len(prior)}"
-                passed3 = value >= 2 * med
-            else:
-                opp_reason = "first_recorded_purchase"
-                passed3 = True
-            candidate["opportunistic_reason"] = opp_reason
-            if not passed3:
-                continue
-            state["funnel"]["filter3_opportunistic"] += 1
-            append_jsonl(STAGE3_PATH, candidate)
+            for t in deduped_txns:
+                try:
+                    shares = float(t["shares"])
+                    price = float(t["price_per_share"])
+                except (TypeError, ValueError):
+                    continue
+                value = shares * price
+                if value < 250000:
+                    continue
+                state["funnel"]["filter2_value_250k"] += 1
 
-            # --- filter 4: director/officer (not just 10% owner) ---
-            if not (candidate["is_director"] or candidate["is_officer"]):
-                continue
-            state["funnel"]["filter4_director_officer"] += 1
-            candidate["filer_role"] = "; ".join(
-                r for r, ok in [("Director", candidate["is_director"]),
-                                 ("Officer" + (f" ({candidate['officer_title']})" if candidate["officer_title"] else ""), candidate["is_officer"])]
-                if ok
-            )
-            append_jsonl(STAGE4_PATH, candidate)
+                candidate = {
+                    "owner_cik_padded": parsed["owner_cik_padded"],
+                    "owner_cik": parsed["owner_cik"],
+                    "owner_name": parsed["owner_name"],
+                    "issuer_cik_padded": parsed["issuer_cik_padded"],
+                    "issuer_cik": parsed["issuer_cik"],
+                    "issuer_name": parsed["issuer_name"],
+                    "issuer_ticker": parsed["issuer_ticker"],
+                    "filing_date": parsed["_file_date"],
+                    "transaction_date": t["transaction_date"],
+                    "transaction_code": t["transaction_code"],
+                    "shares": shares,
+                    "price_per_share": price,
+                    "transaction_value": value,
+                    "is_director": parsed["is_director"],
+                    "is_officer": parsed["is_officer"],
+                    "is_ten_pct_owner": parsed["is_ten_pct_owner"],
+                    "officer_title": parsed["officer_title"],
+                    "sic_code": (parsed["_sics"][0] if parsed.get("_sics") else None),
+                    "source_filing_url": parsed["_source_url"],
+                    "file_num": parsed.get("_file_num"),
+                }
+                append_jsonl(STAGE12_PATH, candidate)
 
-            # --- filter 5: market cap $200M-$20B at filing date ---
-            if not candidate["issuer_cik_padded"]:
-                continue
-            shares_out = issuer_shares_outstanding(candidate["issuer_cik_padded"], candidate["filing_date"])
-            if shares_out is None:
-                continue
-            mkt_cap = shares_out * price  # price-per-share from this open-market purchase used as the
-                                           # filing-date price proxy -- see filter_log.txt "market cap" note
-            if not (200_000_000 <= mkt_cap <= 20_000_000_000):
-                continue
-            state["funnel"]["filter5_market_cap"] += 1
-            candidate["issuer_market_cap_at_filing"] = mkt_cap
-            candidate["shares_outstanding_used"] = shares_out
+                # --- filter 3: opportunistic screen ---
+                if not candidate["owner_cik_padded"] or not candidate["filing_date"]:
+                    continue
+                prior = get_owner_prior_purchases(candidate["owner_cik_padded"], candidate["filing_date"])
+                if prior:
+                    med = statistics.median(p["value"] for p in prior)
+                    opp_reason = f"prior_median={med:.2f}, n_prior={len(prior)}"
+                    passed3 = value >= 2 * med
+                else:
+                    opp_reason = "first_recorded_purchase"
+                    passed3 = True
+                candidate["opportunistic_reason"] = opp_reason
+                if not passed3:
+                    continue
+                state["funnel"]["filter3_opportunistic"] += 1
+                append_jsonl(STAGE3_PATH, candidate)
 
-            # --- filter 6: exchange NYSE or Nasdaq ---
-            ex_rows = exchange_map.get(candidate["issuer_cik"], [])
-            match = None
-            for row in ex_rows:
-                if row["ticker"] == candidate["issuer_ticker"]:
-                    match = row
-                    break
-            if match is None and ex_rows:
-                match = ex_rows[0]
-            if match is None or match["exchange"] not in ("NYSE", "Nasdaq"):
-                continue
-            state["funnel"]["filter6_exchange"] += 1
-            candidate["exchange"] = match["exchange"]
-            candidate["ticker"] = match["ticker"] or candidate["issuer_ticker"]
+                # --- filter 4: director/officer (not just 10% owner) ---
+                if not (candidate["is_director"] or candidate["is_officer"]):
+                    continue
+                state["funnel"]["filter4_director_officer"] += 1
+                candidate["filer_role"] = "; ".join(
+                    r for r, ok in [("Director", candidate["is_director"]),
+                                     ("Officer" + (f" ({candidate['officer_title']})" if candidate["officer_title"] else ""), candidate["is_officer"])]
+                    if ok
+                )
+                append_jsonl(STAGE4_PATH, candidate)
 
-            append_jsonl(FINAL_PATH, candidate)
+                # --- filter 5: market cap $200M-$20B at filing date ---
+                if not candidate["issuer_cik_padded"]:
+                    continue
+                shares_out = issuer_shares_outstanding(candidate["issuer_cik_padded"], candidate["filing_date"])
+                if shares_out is None:
+                    continue
+                mkt_cap = shares_out * price  # price-per-share from this open-market purchase used as the
+                                               # filing-date price proxy -- see filter_log.txt "market cap" note
+                if not (200_000_000 <= mkt_cap <= 20_000_000_000):
+                    continue
+                state["funnel"]["filter5_market_cap"] += 1
+                candidate["issuer_market_cap_at_filing"] = mkt_cap
+                candidate["shares_outstanding_used"] = shares_out
 
-        save_state(state)  # checkpoint after every filing, not just every day
+                # --- filter 6: exchange NYSE or Nasdaq ---
+                # Primary source: SEC's own company_tickers_exchange.json.
+                # This is a CURRENT-DAY snapshot, so an issuer that has
+                # since been delisted/acquired/gone bankrupt (Revlon, Ion
+                # Geophysical, etc. -- both legitimately NYSE-listed at
+                # their filing date) simply won't appear in it, which
+                # would silently survivorship-bias the sample toward
+                # companies still trading today. Fallback: the filing's
+                # own Exchange Act file number (captured at filing time,
+                # from EDGAR full-text search metadata, no extra request)
+                # -- "001-" prefix = registered under Sec 12(b), i.e.
+                # listed on a national securities exchange at filing date;
+                # "000-"/absent = Sec 12(g)/OTC. This can't distinguish
+                # NYSE vs Nasdaq vs a minor exchange (NYSE American, etc.)
+                # for delisted issuers, so such rows are labelled
+                # accordingly rather than a hard NYSE/Nasdaq claim -- see
+                # filter_log.txt.
+                ex_rows = exchange_map.get(candidate["issuer_cik"], [])
+                match = None
+                for row in ex_rows:
+                    if row["ticker"] == candidate["issuer_ticker"]:
+                        match = row
+                        break
+                if match is None and ex_rows:
+                    match = ex_rows[0]
+
+                if match is not None:
+                    if match["exchange"] not in ("NYSE", "Nasdaq"):
+                        continue
+                    exchange_label = match["exchange"]
+                    ticker_label = match["ticker"] or candidate["issuer_ticker"]
+                    exchange_source = "current_sec_ticker_exchange_file"
+                else:
+                    fn = candidate.get("file_num") or ""
+                    if not fn.startswith("001-"):
+                        continue
+                    exchange_label = "NYSE/Nasdaq (inferred, not in current listing file)"
+                    ticker_label = candidate["issuer_ticker"]
+                    exchange_source = "file_num_prefix_fallback"
+
+                state["funnel"]["filter6_exchange"] += 1
+                candidate["exchange"] = exchange_label
+                candidate["ticker"] = ticker_label
+                candidate["exchange_source"] = exchange_source
+
+                append_jsonl(FINAL_PATH, candidate)
+
+            save_state(state)  # checkpoint after every filing, not just every day
 
     day_summary["funnel_after_day"] = dict(state["funnel"])
     day_summary["final_rows_so_far"] = count_lines(FINAL_PATH)
