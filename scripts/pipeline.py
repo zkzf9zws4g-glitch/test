@@ -59,9 +59,9 @@ DAY_LOG_PATH = os.path.join(LOG_DIR, "day_progress.jsonl")
 # Stop pulling more days once we have this many full survivors (buffer
 # above the 40-50 target so the final random-sample-of-50 step, if
 # triggered, has real headroom).
-TARGET_FINAL_BUFFER = 65
-MAX_DAYS_BUDGET = 130
-MAX_PRIOR_FILINGS_PER_OWNER = 40  # see filter_log.txt "opportunistic screen" note
+TARGET_FINAL_BUFFER = 52
+MAX_DAYS_BUDGET = 160
+MAX_PRIOR_FILINGS_PER_OWNER = 20  # see filter_log.txt "opportunistic screen" note
 
 FTS_BASE = "https://efts.sec.gov/LATEST/search-index"
 PRICE_MISSING_SENTINEL = object()
@@ -152,6 +152,7 @@ def fetch_day_filings(day):
             filename = h["_id"].split(":", 1)[1]
             if not filename.lower().endswith(".xml"):  # primary Form 4 doc is always XML
                 continue
+            file_nums = src.get("file_num") or []
             hits.append({
                 "id": h["_id"],
                 "adsh": src["adsh"],
@@ -159,6 +160,7 @@ def fetch_day_filings(day):
                 "file_date": src.get("file_date"),
                 "display_names": src.get("display_names", []),
                 "sics": src.get("sics", []),
+                "file_num": file_nums[0] if file_nums else None,
             })
         frm += page_size
         if frm >= total or frm >= 9900:  # stay under the 10k window cap
@@ -199,6 +201,7 @@ def fetch_and_parse_filing(hit):
     parsed["_source_url"] = url
     parsed["_file_date"] = hit["file_date"]
     parsed["_sics"] = hit.get("sics", [])
+    parsed["_file_num"] = hit.get("file_num")
     return parsed
 
 
@@ -396,6 +399,7 @@ def process_day(day, state, exchange_map):
                 "officer_title": parsed["officer_title"],
                 "sic_code": (parsed["_sics"][0] if parsed.get("_sics") else None),
                 "source_filing_url": parsed["_source_url"],
+                "file_num": parsed.get("_file_num"),
             }
             append_jsonl(STAGE12_PATH, candidate)
 
@@ -442,6 +446,20 @@ def process_day(day, state, exchange_map):
             candidate["shares_outstanding_used"] = shares_out
 
             # --- filter 6: exchange NYSE or Nasdaq ---
+            # Primary source: SEC's own company_tickers_exchange.json. This
+            # is a CURRENT-DAY snapshot, so an issuer that has since been
+            # delisted/acquired/gone bankrupt (Revlon, Ion Geophysical, etc.
+            # -- both legitimately NYSE-listed at their filing date) simply
+            # won't appear in it, which would silently survivorship-bias the
+            # sample toward companies still trading today. Fallback: the
+            # filing's own Exchange Act file number (captured at filing
+            # time, from EDGAR full-text search metadata, no extra request)
+            # -- "001-" prefix = registered under Sec 12(b), i.e. listed on
+            # a national securities exchange at filing date; "000-"/absent
+            # = Sec 12(g)/OTC. This can't distinguish NYSE vs Nasdaq vs a
+            # minor exchange (NYSE American, etc.) for delisted issuers, so
+            # such rows are labelled accordingly rather than a hard NYSE/
+            # Nasdaq claim -- see filter_log.txt.
             ex_rows = exchange_map.get(candidate["issuer_cik"], [])
             match = None
             for row in ex_rows:
@@ -450,11 +468,25 @@ def process_day(day, state, exchange_map):
                     break
             if match is None and ex_rows:
                 match = ex_rows[0]
-            if match is None or match["exchange"] not in ("NYSE", "Nasdaq"):
-                continue
+
+            if match is not None:
+                if match["exchange"] not in ("NYSE", "Nasdaq"):
+                    continue
+                exchange_label = match["exchange"]
+                ticker_label = match["ticker"] or candidate["issuer_ticker"]
+                exchange_source = "current_sec_ticker_exchange_file"
+            else:
+                fn = candidate.get("file_num") or ""
+                if not fn.startswith("001-"):
+                    continue
+                exchange_label = "NYSE/Nasdaq (inferred, not in current listing file)"
+                ticker_label = candidate["issuer_ticker"]
+                exchange_source = "file_num_prefix_fallback"
+
             state["funnel"]["filter6_exchange"] += 1
-            candidate["exchange"] = match["exchange"]
-            candidate["ticker"] = match["ticker"] or candidate["issuer_ticker"]
+            candidate["exchange"] = exchange_label
+            candidate["ticker"] = ticker_label
+            candidate["exchange_source"] = exchange_source
 
             append_jsonl(FINAL_PATH, candidate)
 
