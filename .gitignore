@@ -1,0 +1,6 @@
+data/cache/
+data/logs/
+data/state/
+data/raw/
+__pycache__/
+*.pyc
